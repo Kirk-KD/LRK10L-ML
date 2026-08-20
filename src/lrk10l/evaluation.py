@@ -1,8 +1,9 @@
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, average_precision_score, log_loss
+from sklearn.metrics import accuracy_score, average_precision_score, log_loss, f1_score
 
 
 def precision_recall(y_true, y_pred_binary):
@@ -14,13 +15,34 @@ def precision_recall(y_true, y_pred_binary):
     return precision, recall
 
 
+def best_f1_threshold(y_true, scores):
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+    candidates = np.unique(scores)
+    best_t, best_f1 = candidates[0], -1.0
+    for t in candidates:
+        f1 = f1_score(y_true, (scores >= t).astype(int), zero_division=0)
+        if f1 > best_f1:
+            best_t, best_f1 = t, f1
+    return float(best_t), float(best_f1)
+
+
+def get_validation_species(all_species, test_species):
+    """Deterministically pick one non-test species as the validation species,
+    cyclically, so validation duty rotates across folds reproducibly."""
+    others = sorted(s for s in all_species if s != test_species)
+    idx = sorted(all_species).index(test_species) % len(others)
+    return others[idx]
+
+
 class LOGOEvaluator:
-    def __init__(self, logo, X, y, groups, threshold=0.5, X_full=None, y_full=None, groups_full=None):
+    def __init__(self, logo, X, y, groups, auto_threshold=True,
+                 X_full=None, y_full=None, groups_full=None):
         self.logo = logo
         self.X = X
         self.y = y
         self.groups = groups
-        self.threshold = threshold
+        self.auto_threshold = auto_threshold
         self.X_full = X_full
         self.y_full = y_full
         self.groups_full = groups_full
@@ -35,97 +57,121 @@ class LOGOEvaluator:
         n_splits = self.logo.get_n_splits(self.X, self.y, groups=self.groups)
         pbar = tqdm(self.logo.split(self.X, self.y, groups=self.groups), total=n_splits, desc="Evaluating")
 
-        for train_idx, val_idx in pbar:
-            held_out_species = self.groups[val_idx][0]
-            held_out_species_pretty = held_out_species.split('_')[0]
-            pbar.set_postfix_str(held_out_species_pretty)
+        all_species = sorted(set(self.groups))
 
-            X_train, y_train = self.transform_data_per_split(
-                self.X.iloc[train_idx], self.y[train_idx],
-                is_train=True, held_out_species=held_out_species,
+        for train_idx, test_idx in pbar:
+            test_species = self.groups[test_idx][0]
+            test_species_pretty = test_species.split('_')[0]
+            pbar.set_postfix_str(test_species_pretty)
+
+            validation_species = get_validation_species(all_species, test_species)
+
+            groups_train = self.groups[train_idx]
+            fit_mask = groups_train != validation_species
+            valspecies_mask = groups_train == validation_species
+
+            fit_idx = train_idx[fit_mask]
+            valspecies_idx = train_idx[valspecies_mask]
+
+            X_fit, y_fit = self.transform_data_per_split(
+                self.X.iloc[fit_idx], self.y[fit_idx],
+                is_train=True, held_out_species=test_species,
             )
-            X_val, y_val = self.transform_data_per_split(
-                self.X.iloc[val_idx], self.y[val_idx],
-                is_train=False, held_out_species=held_out_species,
+            X_valspecies, y_valspecies = self.transform_data_per_split(
+                self.X.iloc[valspecies_idx], self.y[valspecies_idx],
+                is_train=False, held_out_species=validation_species,
+            )
+            X_test, y_test = self.transform_data_per_split(
+                self.X.iloc[test_idx], self.y[test_idx],
+                is_train=False, held_out_species=test_species,
             )
 
-            model = self.make_model_per_split(X_train, y_train)
-            model = self.fit_model_per_split(model, X_train, y_train, X_val, y_val)
+            model = self.make_model_per_split(X_fit, y_fit)
+            model = self.fit_model_per_split(model, X_fit, y_fit, X_valspecies, y_valspecies)
 
-            train_preds = model.predict_proba(X_train)[:, 1]
-            val_preds = model.predict_proba(X_val)[:, 1]
+            fit_preds = model.predict_proba(X_fit)[:, 1]
+            valspecies_preds = model.predict_proba(X_valspecies)[:, 1]
+            test_preds = model.predict_proba(X_test)[:, 1]
 
-            train_pr_auc = average_precision_score(y_train, train_preds)
-            val_pr_auc = average_precision_score(y_val, val_preds)
+            if self.auto_threshold:
+                threshold, val_f1 = best_f1_threshold(y_valspecies, valspecies_preds)
+            else:
+                threshold, val_f1 = 0.5, float('nan')
 
-            train_pred_binary = train_preds >= self.threshold
-            val_pred_binary = val_preds >= self.threshold
+            fit_pr_auc = average_precision_score(y_fit, fit_preds)
+            test_pr_auc = average_precision_score(y_test, test_preds)
 
-            train_precision, train_recall = precision_recall(y_train, train_pred_binary)
-            val_precision, val_recall = precision_recall(y_val, val_pred_binary)
+            fit_pred_binary = fit_preds >= threshold
+            test_pred_binary = test_preds >= threshold
 
-            train_accuracy = accuracy_score(y_train, train_pred_binary)
-            val_accuracy = accuracy_score(y_val, val_pred_binary)
+            fit_precision, fit_recall = precision_recall(y_fit, fit_pred_binary)
+            test_precision, test_recall = precision_recall(y_test, test_pred_binary)
 
-            train_bias = train_preds.mean() - y_train.mean()
-            val_bias = val_preds.mean() - y_val.mean()
+            fit_accuracy = accuracy_score(y_fit, fit_pred_binary)
+            test_accuracy = accuracy_score(y_test, test_pred_binary)
 
-            train_logloss = log_loss(y_train, train_preds, labels=[0, 1])
-            val_logloss = log_loss(y_val, val_preds, labels=[0, 1])
+            fit_bias = fit_preds.mean() - y_fit.mean()
+            test_bias = test_preds.mean() - y_test.mean()
 
-            baseline = float(y_val.mean())
-            lift = val_pr_auc / baseline if baseline > 0 else float('nan')
+            fit_logloss = log_loss(y_fit, fit_preds, labels=[0, 1])
+            test_logloss = log_loss(y_test, test_preds, labels=[0, 1])
 
-            X_val_full = y_val_full = preds_full = None
+            baseline = float(y_test.mean())
+            lift = test_pr_auc / baseline if baseline > 0 else float('nan')
+
+            X_test_full = y_test_full = preds_full = None
             if self.X_full is not None:
-                full_mask = self.groups_full == held_out_species
-                X_val_full = self.X_full[full_mask]
-                y_val_full = self.y_full[full_mask]
+                full_mask = self.groups_full == test_species
+                X_test_full = self.X_full[full_mask]
+                y_test_full = self.y_full[full_mask]
 
-                preds_full = model.predict_proba(X_val_full)[:, 1]
-                predicted_positive_full = preds_full >= self.threshold
+                preds_full = model.predict_proba(X_test_full)[:, 1]
+                predicted_positive_full = preds_full >= threshold
 
-                found = int(((y_val_full == 1) & predicted_positive_full).sum())
-                false_positives = int(((y_val_full == 0) & predicted_positive_full).sum())
-                n_pos = int(y_val_full.sum())
+                found = int(((y_test_full == 1) & predicted_positive_full).sum())
+                false_positives = int(((y_test_full == 0) & predicted_positive_full).sum())
+                n_pos = int(y_test_full.sum())
 
-                self.fold_details[held_out_species] = pd.DataFrame({
-                    'id': X_val_full.index,
-                    'y_true': y_val_full,
+                self.fold_details[test_species] = pd.DataFrame({
+                    'id': X_test_full.index,
+                    'y_true': y_test_full,
                     'pred': preds_full,
                 }).sort_values('pred', ascending=False).reset_index(drop=True)
             else:
-                found = int(((y_val == 1) & val_pred_binary).sum())
-                false_positives = int(((y_val == 0) & val_pred_binary).sum())
-                n_pos = int(y_val.sum())
+                found = int(((y_test == 1) & test_pred_binary).sum())
+                false_positives = int(((y_test == 0) & test_pred_binary).sum())
+                n_pos = int(y_test.sum())
 
-            extra = self.extra_metrics_per_split(model, X_train, y_train, X_val, y_val)
+            extra = self.extra_metrics_per_split(model, X_fit, y_fit, X_test, y_test)
 
-            self.fold_results[held_out_species] = {
-                'species': held_out_species_pretty,
+            self.fold_results[test_species] = {
+                'species': test_species_pretty,
+                'validation_species': validation_species.split('_')[0],
+                'threshold': threshold,
+                'val_f1_at_threshold': val_f1,
                 'baseline': baseline,
                 'lift': lift,
-                'train_pr_auc': train_pr_auc,
-                'val_pr_auc': val_pr_auc,
-                'gap': train_pr_auc - val_pr_auc,
-                'log_loss_gap': val_logloss - train_logloss,
-                'train_precision': train_precision,
-                'val_precision': val_precision,
-                'train_recall': train_recall,
-                'val_recall': val_recall,
-                'train_accuracy': train_accuracy,
-                'val_accuracy': val_accuracy,
-                'train_bias': train_bias,
-                'val_bias': val_bias,
+                'fit_pr_auc': fit_pr_auc,
+                'test_pr_auc': test_pr_auc,
+                'gap': fit_pr_auc - test_pr_auc,
+                'log_loss_gap': test_logloss - fit_logloss,
+                'fit_precision': fit_precision,
+                'test_precision': test_precision,
+                'fit_recall': fit_recall,
+                'test_recall': test_recall,
+                'fit_accuracy': fit_accuracy,
+                'test_accuracy': test_accuracy,
+                'fit_bias': fit_bias,
+                'test_bias': test_bias,
                 'n_pos': n_pos,
                 'found': found,
                 'false_positives': false_positives,
                 **extra,
             }
-            self.fold_preds[held_out_species] = {'y_true': y_val, 'preds': val_preds}
-            self.fold_models[held_out_species] = model
-            self.fold_artifacts[held_out_species] = self.extra_artifacts_per_split(
-                model, X_train, y_train, X_val, y_val, X_val_full, y_val_full, preds_full
+            self.fold_preds[test_species] = {'y_true': y_test, 'preds': test_preds}
+            self.fold_models[test_species] = model
+            self.fold_artifacts[test_species] = self.extra_artifacts_per_split(
+                model, X_fit, y_fit, X_test, y_test, X_test_full, y_test_full, preds_full
             )
 
         return self
