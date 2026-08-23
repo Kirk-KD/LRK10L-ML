@@ -2,3 +2,4 @@ __pycache__/
 saves/
 intermediate/
 graphs/
+.DS_Store
