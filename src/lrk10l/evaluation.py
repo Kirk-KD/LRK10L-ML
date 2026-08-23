@@ -178,7 +178,12 @@ class LOGOEvaluator:
 
     @property
     def results_df(self) -> pd.DataFrame:
-        return pd.DataFrame(self.fold_results).T
+        df = pd.DataFrame(self.fold_results).T
+        string_cols = ['species', 'validation_species']
+        for col in df.columns:
+            if col not in string_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
 
     def make_model_per_split(self, X_train, y_train) -> Any:
         raise NotImplementedError
