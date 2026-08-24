@@ -35,6 +35,21 @@ def get_validation_species(all_species, test_species):
     return others[idx]
 
 
+NON_FEATURE_COLUMNS = ('species', 'gene', 'seq', 'label')
+
+
+def split_gene_dataset(df):
+    """Split a gene-level feature dataset (as produced by data.ipynb: columns
+    `species`, `gene`, `seq`, `label` plus one column per feature) into
+    (X, y, groups), indexed by gene id."""
+    df = df.set_index('gene')
+    feature_cols = [c for c in df.columns if c not in NON_FEATURE_COLUMNS]
+    X = df[feature_cols]
+    y = df['label'].to_numpy(dtype=int)
+    groups = df['species'].to_numpy()
+    return X, y, groups
+
+
 class LOGOEvaluator:
     def __init__(self, logo, X, y, groups, auto_threshold=True,
                  X_full=None, y_full=None, groups_full=None):
@@ -52,6 +67,23 @@ class LOGOEvaluator:
         self.fold_models = {}
         self.fold_artifacts = {}
         self.fold_details = {}
+
+    @classmethod
+    def from_gene_dataset(cls, logo, df, dupe_genes=(), auto_threshold=True, **kwargs):
+        """Build an evaluator directly from a gene-level feature dataset as
+        produced by data.ipynb (columns: species, gene, seq, label, <features>).
+
+        `dupe_genes` (gene ids) are dropped when fitting models and computing
+        fit/test metrics, to avoid near-duplicate proteins inflating apparent
+        performance. Predictions are still made on the full, non-deduplicated
+        set so that `n_pos`, `found`, and `false_positives` reflect true
+        protein counts.
+        """
+        df_deduped = df[~df['gene'].isin(dupe_genes)]
+        X, y, groups = split_gene_dataset(df_deduped)
+        X_full, y_full, groups_full = split_gene_dataset(df)
+        return cls(logo, X, y, groups, auto_threshold=auto_threshold,
+                    X_full=X_full, y_full=y_full, groups_full=groups_full, **kwargs)
 
     def fit(self):
         n_splits = self.logo.get_n_splits(self.X, self.y, groups=self.groups)
@@ -87,7 +119,9 @@ class LOGOEvaluator:
             )
 
             model = self.make_model_per_split(X_fit, y_fit)
-            model = self.fit_model_per_split(model, X_fit, y_fit, X_valspecies, y_valspecies)
+            model = self.fit_model_per_split(
+                model, X_fit, y_fit, X_valspecies, y_valspecies, X_test, y_test,
+            )
 
             fit_preds = model.predict_proba(X_fit)[:, 1]
             valspecies_preds = model.predict_proba(X_valspecies)[:, 1]
@@ -188,16 +222,16 @@ class LOGOEvaluator:
     def make_model_per_split(self, X_train, y_train) -> Any:
         raise NotImplementedError
 
-    def fit_model_per_split(self, model, X_train, y_train, X_val, y_val) -> Any:
+    def fit_model_per_split(self, model, X_train, y_train, X_val, y_val, X_test, y_test) -> Any:
         model.fit(X_train, y_train)
         return model
 
     def transform_data_per_split(self, X, y, is_train, held_out_species):
         return X, y
 
-    def extra_metrics_per_split(self, model, X_train, y_train, X_val, y_val) -> dict:
+    def extra_metrics_per_split(self, model, X_train, y_train, X_test, y_test) -> dict:
         return {}
 
-    def extra_artifacts_per_split(self, model, X_train, y_train, X_val, y_val,
-                                   X_val_full, y_val_full, preds_full) -> dict:
+    def extra_artifacts_per_split(self, model, X_train, y_train, X_test, y_test, 
+                                  X_test_full, y_test_full, preds_full) -> dict:
         return {}
